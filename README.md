@@ -1,9 +1,6 @@
 # not-quite-tiny-dfr
 
 > [!NOTE]
-> This project is entirely vibe-coded.
-
-> [!NOTE]
 > Everything is only tested on my 2019 15" MacBook Pro running arch linux. Things may break in other distros/macs. If you are able to run this successfully on other machines without any issues, please email me at developer.seojoonlee@gmail.com. If you encountered any issues please create an issue or a PR. Contributions are always welcome. I will be adding a seperate "Supported Distros/Devices" section to this README in the near future.
 
 Not quite the most basic dynamic function row daemon possible. That will be [tiny-dfr](https://github.com/AsahiLinux/tiny-dfr). This is not-quite-tiny-dfr. A customizable Touch Bar daemon for Apple T2 and Silicon Macs, forked from [tiny-dfr](https://github.com/AsahiLinux/tiny-dfr). It adds full theming
