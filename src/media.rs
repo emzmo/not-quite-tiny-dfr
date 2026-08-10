@@ -200,8 +200,12 @@ fn gap_at(lines: &[(f64, String)], time: f64) -> bool {
 
 /// Parse LRC synced lyrics into `(start_seconds, text)` pairs, sorted by time.
 /// A line may carry several timestamps (`[t1][t2]text`); each yields an entry.
+/// A global `[offset:ms]` tag shifts every timestamp: positive means the
+/// author synced the lines late and lyrics should display that much earlier
+/// (`t - offset`) -- dropping it leaves the whole track off by the offset.
 fn parse_lrc(text: &str) -> Vec<(f64, String)> {
     let mut out: Vec<(f64, String)> = Vec::new();
+    let mut offset = 0.0;
     for line in text.lines() {
         let mut rest = line;
         let mut times = Vec::new();
@@ -216,7 +220,19 @@ fn parse_lrc(text: &str) -> Vec<(f64, String)> {
                     times.push(t);
                     rest = &after_open[close + 1..];
                 }
-                None => break, // a metadata tag like [ar:...]; not a lyric line
+                None => {
+                    // A metadata tag, not a lyric line. `[offset:ms]` is the
+                    // one that matters; the rest ([ar:...] etc.) are noise.
+                    let tag = tag.trim();
+                    if let Some(ms) = tag
+                        .get(..7)
+                        .filter(|p| p.eq_ignore_ascii_case("offset:"))
+                        .and_then(|_| tag[7..].trim().parse::<f64>().ok())
+                    {
+                        offset = ms / 1000.0;
+                    }
+                    break;
+                }
             }
         }
         if times.is_empty() {
@@ -232,6 +248,13 @@ fn parse_lrc(text: &str) -> Vec<(f64, String)> {
         }
         for t in times {
             out.push((t, lyric.clone()));
+        }
+    }
+    // Applied after the scan (not per line) so an offset tag placed below the
+    // first lyric lines still shifts them.
+    if offset != 0.0 {
+        for entry in out.iter_mut() {
+            entry.0 = (entry.0 - offset).max(0.0);
         }
     }
     out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -327,34 +350,58 @@ fn netease_get(url: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// How far a candidate's duration may sit from the track's (seconds) before it
+/// is rejected as a different recording. Provider durations round to whole
+/// seconds and players report slightly trimmed lengths, so a couple of seconds
+/// is normal -- but a sped-up edit or extended version lands well outside this,
+/// and its lyrics would run uniformly fast or slow over the whole song.
+const LYRIC_DURATION_SLACK: f64 = 4.0;
+
 /// Fetch synced lyrics from NetEase, the fallback for tracks lrclib doesn't
 /// cover (its catalog is large, especially for non-English music). Searches by
 /// "title artist", then tries each song whose artist matches ours
-/// case-insensitively (either direction, mirroring the lrclib guard) and
-/// returns the first non-empty LRC -- catalog entries with no lyrics are
-/// common, so committing to a single candidate loses tracks the next
-/// candidate covers.
-fn fetch_netease(title: &str, artist: &str) -> Option<String> {
+/// case-insensitively (either direction, mirroring the lrclib guard) and whose
+/// duration is near the track's (closest first), returning the first non-empty
+/// LRC -- catalog entries with no lyrics are common, so committing to a single
+/// candidate loses tracks the next candidate covers.
+fn fetch_netease(title: &str, artist: &str, duration: f64) -> Option<String> {
     let query = urlencode(&format!("{title} {artist}"));
     let search = format!("https://music.163.com/api/search/get?s={query}&type=1&limit=5");
     let results: Value = serde_json::from_str(&netease_get(&search)?).ok()?;
     let songs = results.get("result")?.get("songs")?.as_array()?;
 
     let artist_lc = artist.to_lowercase();
-    songs
+    let mut candidates: Vec<(f64, i64)> = songs
         .iter()
         .filter_map(|s| {
             let name = s.get("artists")?.as_array()?.first()?.get("name")?.as_str()?;
             let name_lc = name.to_lowercase();
-            let matches = artist_lc.contains(&name_lc) || name_lc.contains(&artist_lc);
-            matches.then(|| s.get("id")?.as_i64()).flatten()
+            if !artist_lc.contains(&name_lc) && !name_lc.contains(&artist_lc) {
+                return None;
+            }
+            // NetEase reports duration in milliseconds. With no known track
+            // length there is nothing to gate on; keep the search order.
+            let diff = if duration > 0.0 {
+                let dur = s.get("duration")?.as_f64()? / 1000.0;
+                let diff = (dur - duration).abs();
+                if diff > LYRIC_DURATION_SLACK {
+                    return None;
+                }
+                diff
+            } else {
+                0.0
+            };
+            Some((diff, s.get("id")?.as_i64()?))
         })
-        .find_map(|id| {
-            let lyric_url = format!("https://music.163.com/api/song/lyric?id={id}&lv=1&kv=1&tv=-1");
-            let doc: Value = serde_json::from_str(&netease_get(&lyric_url)?).ok()?;
-            let lrc = doc.get("lrc")?.get("lyric")?.as_str()?;
-            (!lrc.is_empty()).then(|| lrc.to_string())
-        })
+        .collect();
+    // Stable, so equal diffs (and the unknown-length case) keep search order.
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    candidates.into_iter().find_map(|(_, id)| {
+        let lyric_url = format!("https://music.163.com/api/song/lyric?id={id}&lv=1&kv=1&tv=-1");
+        let doc: Value = serde_json::from_str(&netease_get(&lyric_url)?).ok()?;
+        let lrc = doc.get("lrc")?.get("lyric")?.as_str()?;
+        (!lrc.is_empty()).then(|| lrc.to_string())
+    })
 }
 
 /// Fetch synced lyrics, trying lrclib first, then NetEase. Within lrclib the
@@ -396,13 +443,33 @@ fn fetch_lrc(title: &str, artist: &str, album: &str, duration: f64) -> Option<St
             .ok()
             .as_ref()
             .and_then(Value::as_array)
-            .and_then(|arr| arr.iter().find_map(synced_from_object))
+            .and_then(|arr| best_synced_from_search(arr, duration))
         {
             return Some(lrc);
         }
     }
     // Nothing on lrclib -- fall back to NetEase.
-    fetch_netease(title, artist)
+    fetch_netease(title, artist, duration)
+}
+
+/// Pick synced lyrics from an lrclib search result list: the entry whose
+/// duration is closest to the track's, and within `LYRIC_DURATION_SLACK` --
+/// the search endpoint matches loosely, and its first hit can be a different
+/// recording (sped-up edit, extended version) whose timings never line up.
+/// With no known track length there is nothing to gate on; the first synced
+/// entry stands.
+fn best_synced_from_search(arr: &[Value], duration: f64) -> Option<String> {
+    if duration <= 0.0 {
+        return arr.iter().find_map(synced_from_object);
+    }
+    arr.iter()
+        .filter_map(|v| {
+            let lrc = synced_from_object(v)?;
+            let diff = (v.get("duration")?.as_f64()? - duration).abs();
+            (diff <= LYRIC_DURATION_SLACK).then_some((diff, lrc))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, lrc)| lrc)
 }
 
 /// Cap on the number of tracks kept in the on-disk lyric cache; the entries
