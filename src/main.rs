@@ -2760,7 +2760,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             match event {
                 Event::Device(DeviceEvent::Added(evt)) => {
                     let dev = evt.device();
-                    if dev.name().contains(" Touch Bar") {
+                    if dev.name().contains(" Touch Bar") || dev.name().contains("iBridge Touchpad") {
                         digitizer = Some(dev);
                     }
                 }
