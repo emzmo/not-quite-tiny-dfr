@@ -954,10 +954,15 @@ impl FunctionLayer {
                     stretch = 1;
                 }
                 **state += stretch;
-                // Only OnClick = "Action" lights up on tap. Expand widgets show
-                // their expand animation instead, and buttons with no OnClick
-                // stay flat. Captured before `cfg` is consumed below.
-                let highlight_on_tap = cfg.on_click == Some(OnClick::Action);
+                // OnClick = "Action" lights up on tap (pressed fill). Expand
+                // widgets show their expand animation instead. Command widgets
+                // with a shell-command OnClick also light up so the user gets
+                // tactile feedback that the tap registered. Buttons with no
+                // OnClick stay flat. Captured before `cfg` is consumed below.
+                let highlight_on_tap = match &cfg.on_click {
+                    Some(OnClick::Action) | Some(OnClick::Command(_)) => true,
+                    _ => false,
+                };
                 let mut button = if let (Some(get), Some(set)) =
                     (cfg.slider_get.take(), cfg.slider_set.take())
                 {
@@ -1039,11 +1044,18 @@ impl FunctionLayer {
                     } else {
                         None
                     };
+                    // OnClick = "shell command" on a Command widget runs the
+                    // command on tap, same mechanism as Media widgets.
+                    let tap_command = match cfg.on_click.take() {
+                        Some(OnClick::Command(c)) => Some(c),
+                        _ => None,
+                    };
                     Button::new_command(
                         id,
                         std::mem::take(&mut cfg.action),
                         cfg.theme.take(),
                         expand,
+                        tap_command,
                     )
                 } else {
                     Button::with_config(cfg, default_icon_size)
@@ -3232,7 +3244,13 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                             match state {
                                 TouchState::Held { layer, btn } => {
                                     if btn < layers[layer].buttons.len() {
-                                        layers[layer].buttons[btn].1.set_active(uinput, false);
+                                        let button = &mut layers[layer].buttons[btn].1;
+                                        // Run OnClick shell command on release for
+                                        // Held buttons (non-scrollable layers).
+                                        if let Some(cmd) = button.tap_command.as_ref() {
+                                            media::run_tap_command(cmd);
+                                        }
+                                        button.set_active(uinput, false);
                                     }
                                 }
                                 // A quick tap: press and release (it was
@@ -3314,6 +3332,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                             }
                                         } else {
                                             let button = &mut layers[layer].buttons[btn].1;
+                                            // Run OnClick shell command if present
+                                            // (Command widgets with OnClick = "shell cmd").
+                                            if let Some(cmd) = button.tap_command.as_ref() {
+                                                media::run_tap_command(cmd);
+                                            }
                                             button.emit_keys(uinput, true);
                                             button.emit_keys(uinput, false);
                                             button.set_visual_active(false);
